@@ -94,7 +94,38 @@ class DefaultMigrationManager {
               "Update length of invocation column on outbox for MySQL dialects only.",
               "ALTER TABLE TXNO_OUTBOX MODIFY COLUMN invocation MEDIUMTEXT",
               Map.of(
-                  Dialect.POSTGRESQL_9, "", Dialect.H2, "", Dialect.ORACLE, "SELECT * FROM dual")));
+                  Dialect.POSTGRESQL_9, "", Dialect.H2, "", Dialect.ORACLE, "SELECT * FROM dual")),
+          new Migration(
+              9,
+              "Add groupId",
+              "ALTER TABLE TXNO_OUTBOX ADD COLUMN groupId VARCHAR(250) AFTER uniqueRequestId",
+              Map.of(
+                  Dialect.POSTGRESQL_9,
+                  "ALTER TABLE TXNO_OUTBOX ADD COLUMN groupId VARCHAR(250)",
+                  Dialect.ORACLE,
+                  "ALTER TABLE TXNO_OUTBOX ADD groupId VARCHAR2(250)")),
+          new Migration(
+              10,
+              "Add groupSequence",
+              "ALTER TABLE TXNO_OUTBOX ADD COLUMN groupSequence BIGINT AFTER groupId",
+              Map.of(
+                  Dialect.POSTGRESQL_9,
+                  "ALTER TABLE TXNO_OUTBOX ADD COLUMN groupSequence BIGINT",
+                  Dialect.ORACLE,
+                  "ALTER TABLE TXNO_OUTBOX ADD groupSequence NUMBER(20)")),
+          new Migration(
+              11,
+              "Add group sequence table",
+              "CREATE TABLE TXNO_GROUP_SEQUENCE (\n"
+                  + "    groupId VARCHAR(250) PRIMARY KEY,\n"
+                  + "    nextValue BIGINT NOT NULL"
+                  + ")",
+              Map.of(
+                  Dialect.ORACLE,
+                  "CREATE TABLE TXNO_GROUP_SEQUENCE (\n"
+                      + "    groupId VARCHAR(250) PRIMARY KEY,\n"
+                      + "    nextValue NUMBER(20) NOT NULL"
+                      + ")")));
 
   static void migrate(TransactionManager transactionManager, Dialect dialect) {
     transactionManager.inTransaction(

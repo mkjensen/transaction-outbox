@@ -36,6 +36,11 @@ public class StubPersistor implements Persistor {
   }
 
   @Override
+  public boolean block(Transaction tx, String entryId) {
+    return true;
+  }
+
+  @Override
   public boolean unblock(Transaction tx, String entryId) {
     return true;
   }

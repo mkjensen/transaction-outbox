@@ -12,8 +12,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.MDC;
@@ -104,9 +106,15 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
     }
   }
 
+  private void throwIfNotInitialized() {
+    if (!initialized.get()) {
+      throw new IllegalStateException("Not initialized");
+    }
+  }
+
   @Override
   public <T> T schedule(Class<T> clazz) {
-    return schedule(clazz, null);
+    return schedule(clazz, null, null);
   }
 
   @Override
@@ -117,9 +125,7 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
   @SuppressWarnings("UnusedReturnValue")
   @Override
   public boolean flush() {
-    if (!initialized.get()) {
-      throw new IllegalStateException("Not initialized");
-    }
+    throwIfNotInitialized();
     Instant now = clockProvider.get().instant();
     List<TransactionOutboxEntry> batch = flush(now);
     expireIdempotencyProtection(now);
@@ -146,7 +152,13 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
               return result;
             });
     log.debug("Got batch of {}", batch.size());
-    batch.forEach(this::submitNow);
+    List<CompletableFuture<Void>> orderedFutures =
+        batch.stream()
+            .filter(entry -> entry.getGroupId() != null)
+            .map(entry -> CompletableFuture.runAsync(() -> this.processNow(entry)))
+            .collect(Collectors.toList());
+    batch.stream().filter(entry -> entry.getGroupId() == null).forEach(this::submitNow);
+    orderedFutures.forEach(CompletableFuture::join);
     log.debug("Submitted batch");
     return batch;
   }
@@ -179,10 +191,25 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
   }
 
   @Override
-  public boolean unblock(String entryId) {
-    if (!initialized.get()) {
-      throw new IllegalStateException("Not initialized");
+  public boolean block(String entryId) {
+    throwIfNotInitialized();
+    if (!(transactionManager instanceof ThreadLocalContextTransactionManager)) {
+      throw new UnsupportedOperationException(
+          "This method requires a ThreadLocalContextTransactionManager");
     }
+    log.info("Blocking entry {} for retry", entryId);
+    try {
+      // TODO: Call listener? Which means we have to look up the entry...
+      return ((ThreadLocalContextTransactionManager) transactionManager)
+          .requireTransactionReturns(tx -> persistor.block(tx, entryId));
+    } catch (Exception e) {
+      throw (RuntimeException) Utils.uncheckAndThrow(e);
+    }
+  }
+
+  @Override
+  public boolean unblock(String entryId) {
+    throwIfNotInitialized();
     if (!(transactionManager instanceof ThreadLocalContextTransactionManager)) {
       throw new UnsupportedOperationException(
           "This method requires a ThreadLocalContextTransactionManager");
@@ -199,9 +226,7 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
   @Override
   @SuppressWarnings({"unchecked", "rawtypes"})
   public boolean unblock(String entryId, Object transactionContext) {
-    if (!initialized.get()) {
-      throw new IllegalStateException("Not initialized");
-    }
+    throwIfNotInitialized();
     if (!(transactionManager instanceof ParameterContextTransactionManager)) {
       throw new UnsupportedOperationException(
           "This method requires a ParameterContextTransactionManager");
@@ -220,10 +245,8 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
     }
   }
 
-  private <T> T schedule(Class<T> clazz, String uniqueRequestId) {
-    if (!initialized.get()) {
-      throw new IllegalStateException("Not initialized");
-    }
+  private <T> T schedule(Class<T> clazz, String uniqueRequestId, String groupId) {
+    throwIfNotInitialized();
     return proxyFactory.createProxy(
         clazz,
         (method, args) ->
@@ -236,9 +259,15 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
                           extracted.getMethodName(),
                           extracted.getParameters(),
                           extracted.getArgs(),
-                          uniqueRequestId);
+                          uniqueRequestId,
+                          groupId);
                   validator.validate(entry);
                   persistor.save(extracted.getTransaction(), entry);
+                  if (groupId != null) {
+                    extracted.getTransaction().addPostCommitHook(() -> listener.scheduled(entry));
+                    log.debug("Scheduled {} for running in next flush", entry.description());
+                    return null;
+                  }
                   extracted
                       .getTransaction()
                       .addPostCommitHook(
@@ -311,7 +340,12 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
   }
 
   private TransactionOutboxEntry newEntry(
-      Class<?> clazz, String methodName, Class<?>[] params, Object[] args, String uniqueRequestId) {
+      Class<?> clazz,
+      String methodName,
+      Class<?>[] params,
+      Object[] args,
+      String uniqueRequestId,
+      String groupId) {
     return TransactionOutboxEntry.builder()
         .id(UUID.randomUUID().toString())
         .invocation(
@@ -324,6 +358,7 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
         .lastAttemptTime(null)
         .nextAttemptTime(after(attemptFrequency))
         .uniqueRequestId(uniqueRequestId)
+        .groupId(groupId)
         .build();
   }
 
@@ -348,7 +383,7 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
   private void updateAttemptCount(TransactionOutboxEntry entry, Throwable cause) {
     try {
       entry.setAttempts(entry.getAttempts() + 1);
-      var blocked = entry.getAttempts() >= blockAfterAttempts;
+      var blocked = entry.getGroupId() == null && entry.getAttempts() >= blockAfterAttempts;
       entry.setBlocked(blocked);
       entry.setLastAttemptTime(Instant.now(clockProvider.get()));
       entry.setNextAttemptTime(after(attemptFrequency));
@@ -409,9 +444,17 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
 
     private String uniqueRequestId;
 
+    private String groupId;
+
     @Override
     public ParameterizedScheduleBuilder uniqueRequestId(String uniqueRequestId) {
       this.uniqueRequestId = uniqueRequestId;
+      return this;
+    }
+
+    @Override
+    public ParameterizedScheduleBuilder groupId(final String groupId) {
+      this.groupId = groupId;
       return this;
     }
 
@@ -420,7 +463,10 @@ class TransactionOutboxImpl implements TransactionOutbox, Validatable {
       if (uniqueRequestId != null && uniqueRequestId.length() > 250) {
         throw new IllegalArgumentException("uniqueRequestId may be up to 250 characters");
       }
-      return TransactionOutboxImpl.this.schedule(clazz, uniqueRequestId);
+      if (groupId != null && groupId.length() > 250) {
+        throw new IllegalArgumentException("groupId may be up to 250 characters");
+      }
+      return TransactionOutboxImpl.this.schedule(clazz, uniqueRequestId, groupId);
     }
   }
 }

@@ -10,6 +10,7 @@ import java.sql.SQLIntegrityConstraintViolationException;
 import java.sql.SQLTimeoutException;
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,7 +37,7 @@ import lombok.extern.slf4j.Slf4j;
 public class DefaultPersistor implements Persistor, Validatable {
 
   private static final String ALL_FIELDS =
-      "id, uniqueRequestId, invocation, lastAttemptTime, nextAttemptTime, attempts, blocked, processed, version";
+      "id, uniqueRequestId, groupId, groupSequence, invocation, lastAttemptTime, nextAttemptTime, attempts, blocked, processed, version";
 
   /**
    * @param writeLockTimeoutSeconds How many seconds to wait before timing out on obtaining a write
@@ -60,6 +61,9 @@ public class DefaultPersistor implements Persistor, Validatable {
   @SuppressWarnings("JavaDoc")
   @Builder.Default
   private final String tableName = "TXNO_OUTBOX";
+
+  // TODO: Add Javadoc for groupSequenceTableName
+  @Builder.Default private final String groupSequenceTableName = "TXNO_GROUP_SEQUENCE";
 
   /**
    * @param migrate Set to false to disable automatic database migrations. This may be preferred if
@@ -98,18 +102,23 @@ public class DefaultPersistor implements Persistor, Validatable {
   public void save(Transaction tx, TransactionOutboxEntry entry)
       throws SQLException, AlreadyScheduledException {
     var insertSql =
-        "INSERT INTO " + tableName + " (" + ALL_FIELDS + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        "INSERT INTO "
+            + tableName
+            + " ("
+            + ALL_FIELDS
+            + ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     var writer = new StringWriter();
     serializer.serializeInvocation(entry.getInvocation(), writer);
+    Long groupSequence = getGroupSequence(tx, entry.getGroupId());
     if (entry.getUniqueRequestId() == null) {
       PreparedStatement stmt = tx.prepareBatchStatement(insertSql);
-      setupInsert(entry, writer, stmt);
+      setupInsert(entry, groupSequence, writer, stmt);
       stmt.addBatch();
       log.debug("Inserted {} in batch", entry.description());
     } else {
       //noinspection resource
       try (PreparedStatement stmt = tx.connection().prepareStatement(insertSql)) {
-        setupInsert(entry, writer, stmt);
+        setupInsert(entry, groupSequence, writer, stmt);
         stmt.executeUpdate();
         log.debug("Inserted {} immediately", entry.description());
       } catch (SQLIntegrityConstraintViolationException e) {
@@ -124,21 +133,69 @@ public class DefaultPersistor implements Persistor, Validatable {
         throw e;
       }
     }
+    incrementGroupSequence(tx, entry.getGroupId(), groupSequence);
+  }
+
+  private Long getGroupSequence(Transaction tx, String groupId) throws SQLException {
+    if (groupId == null) {
+      return null;
+    }
+    String selectSql =
+        "SELECT nextValue FROM " + groupSequenceTableName + " WHERE groupId = ? FOR UPDATE";
+    try (PreparedStatement stmt = tx.connection().prepareStatement(selectSql)) {
+      stmt.setString(1, groupId);
+      stmt.setQueryTimeout(writeLockTimeoutSeconds);
+      try (ResultSet rs = stmt.executeQuery()) {
+        if (rs.next()) {
+          return rs.getLong(1);
+        }
+      }
+    }
+    // TODO: Lock some row before being allowed to insert a new group sequence
+    Long groupSequence = Long.MIN_VALUE;
+    String insertSql =
+        "INSERT INTO " + groupSequenceTableName + " (groupId, nextValue) VALUES (?, ?)";
+    try (PreparedStatement stmt = tx.connection().prepareStatement(insertSql)) {
+      stmt.setString(1, groupId);
+      stmt.setLong(2, groupSequence);
+      stmt.executeUpdate();
+    }
+    // TODO: Should "old" group sequences be removed?
+    return groupSequence;
+  }
+
+  private void incrementGroupSequence(Transaction tx, String groupId, Long groupSequence)
+      throws SQLException {
+    if (groupSequence == null) {
+      return;
+    }
+    String updateSql = "UPDATE " + groupSequenceTableName + " SET nextValue = ? WHERE groupId = ?";
+    try (PreparedStatement stmt = tx.connection().prepareStatement(updateSql)) {
+      stmt.setLong(1, groupSequence + 1);
+      stmt.setString(2, groupId);
+      stmt.executeUpdate();
+    }
   }
 
   private void setupInsert(
-      TransactionOutboxEntry entry, StringWriter writer, PreparedStatement stmt)
+      TransactionOutboxEntry entry, Long groupSequence, StringWriter writer, PreparedStatement stmt)
       throws SQLException {
     stmt.setString(1, entry.getId());
     stmt.setString(2, entry.getUniqueRequestId());
-    stmt.setString(3, writer.toString());
+    stmt.setString(3, entry.getGroupId());
+    if (groupSequence == null) {
+      stmt.setNull(4, Types.BIGINT);
+    } else {
+      stmt.setLong(4, groupSequence);
+    }
+    stmt.setString(5, writer.toString());
     stmt.setTimestamp(
-        4, entry.getLastAttemptTime() == null ? null : Timestamp.from(entry.getLastAttemptTime()));
-    stmt.setTimestamp(5, Timestamp.from(entry.getNextAttemptTime()));
-    stmt.setInt(6, entry.getAttempts());
-    stmt.setBoolean(7, entry.isBlocked());
-    stmt.setBoolean(8, entry.isProcessed());
-    stmt.setInt(9, entry.getVersion());
+        6, entry.getLastAttemptTime() == null ? null : Timestamp.from(entry.getLastAttemptTime()));
+    stmt.setTimestamp(7, Timestamp.from(entry.getNextAttemptTime()));
+    stmt.setInt(8, entry.getAttempts());
+    stmt.setBoolean(9, entry.isBlocked());
+    stmt.setBoolean(10, entry.isProcessed());
+    stmt.setInt(11, entry.getVersion());
   }
 
   @Override
@@ -226,6 +283,26 @@ public class DefaultPersistor implements Persistor, Validatable {
   }
 
   @Override
+  public boolean block(Transaction tx, String entryId) throws Exception {
+    @SuppressWarnings("resource")
+    PreparedStatement stmt =
+        tx.prepareBatchStatement(
+            "UPDATE "
+                + tableName
+                + " SET blocked = "
+                + dialect.booleanValue(true)
+                + " "
+                + "WHERE blocked = "
+                + dialect.booleanValue(false)
+                + " AND processed = "
+                + dialect.booleanValue(false)
+                + " AND id = ?");
+    stmt.setString(1, entryId);
+    stmt.setQueryTimeout(writeLockTimeoutSeconds);
+    return stmt.executeUpdate() != 0;
+  }
+
+  @Override
   public boolean unblock(Transaction tx, String entryId) throws Exception {
     @SuppressWarnings("resource")
     PreparedStatement stmt =
@@ -248,6 +325,68 @@ public class DefaultPersistor implements Persistor, Validatable {
   @Override
   public List<TransactionOutboxEntry> selectBatch(Transaction tx, int batchSize, Instant now)
       throws Exception {
+    List<TransactionOutboxEntry> batch = selectBatchOrdered(tx, batchSize, now);
+    int unorderedBatchSize = batchSize - batch.size();
+    if (unorderedBatchSize < 1) {
+      return batch;
+    }
+    List<TransactionOutboxEntry> unorderedBatch = selectBatchUnordered(tx, batchSize, now);
+    batch.addAll(unorderedBatch);
+    return batch;
+  }
+
+  private List<TransactionOutboxEntry> selectBatchOrdered(
+      Transaction tx, int batchSize, Instant now) throws Exception {
+    String forUpdate = dialect.isSupportsSkipLock() ? " FOR UPDATE SKIP LOCKED" : "";
+    try (PreparedStatement stmt =
+        tx.connection()
+            .prepareStatement(
+                dialect.isSupportsWindowFunctions()
+                    ? "WITH t AS"
+                        + " ("
+                        + "   SELECT RANK() OVER (PARTITION BY groupId ORDER BY groupSequence) AS rn, "
+                        + ALL_FIELDS
+                        + "   FROM "
+                        + tableName
+                        + "   WHERE processed = "
+                        + dialect.booleanValue(false)
+                        + " )"
+                        + " SELECT "
+                        + ALL_FIELDS
+                        + " FROM t "
+                        + " WHERE rn = 1 AND nextAttemptTime < ? AND blocked = "
+                        + dialect.booleanValue(false)
+                        + " AND groupId IS NOT NULL "
+                        + dialect.getLimitCriteria()
+                        + (dialect.isSupportsWindowFunctionsForUpdate() ? forUpdate : "")
+                    : "SELECT "
+                        + ALL_FIELDS
+                        + " FROM"
+                        + " ("
+                        + "   SELECT groupId AS group_id, MIN(groupSequence) AS group_sequence"
+                        + "   FROM "
+                        + tableName
+                        + "   WHERE processed = "
+                        + dialect.booleanValue(false)
+                        + "   GROUP BY group_id"
+                        + " ) AS t"
+                        + " JOIN "
+                        + tableName
+                        + " t1"
+                        + " ON t1.groupId = t.group_id AND t1.groupSequence = t.group_sequence"
+                        + " WHERE nextAttemptTime < ? AND blocked = "
+                        + dialect.booleanValue(false)
+                        + " AND groupId IS NOT NULL "
+                        + dialect.getLimitCriteria()
+                        + forUpdate)) {
+      stmt.setTimestamp(1, Timestamp.from(now));
+      stmt.setInt(2, batchSize);
+      return gatherResults(batchSize, stmt);
+    }
+  }
+
+  private List<TransactionOutboxEntry> selectBatchUnordered(
+      Transaction tx, int batchSize, Instant now) throws Exception {
     String forUpdate = dialect.isSupportsSkipLock() ? " FOR UPDATE SKIP LOCKED" : "";
     //noinspection resource
     try (PreparedStatement stmt =
@@ -258,7 +397,8 @@ public class DefaultPersistor implements Persistor, Validatable {
                     + ALL_FIELDS
                     + " FROM "
                     + tableName
-                    + " WHERE nextAttemptTime < ? AND blocked = "
+                    + " WHERE groupId IS NULL"
+                    + " AND nextAttemptTime < ? AND blocked = "
                     + dialect.booleanValue(false)
                     + " AND processed = "
                     + dialect.booleanValue(false)
@@ -301,6 +441,7 @@ public class DefaultPersistor implements Persistor, Validatable {
           TransactionOutboxEntry.builder()
               .id(rs.getString("id"))
               .uniqueRequestId(rs.getString("uniqueRequestId"))
+              .groupId(rs.getString("groupId"))
               .invocation(serializer.deserializeInvocation(invocationStream))
               .lastAttemptTime(
                   rs.getTimestamp("lastAttemptTime") == null

@@ -90,6 +90,9 @@ public interface TransactionOutbox {
   @SuppressWarnings("UnusedReturnValue")
   boolean flush();
 
+  // TODO: Javadoc for block
+  boolean block(String entryId);
+
   /**
    * Unblocks a blocked entry and resets the attempt count so that it will be retried again.
    * Requires an active transaction and a transaction manager that supports thread local context.
@@ -311,6 +314,9 @@ public interface TransactionOutbox {
      * @return Builder.
      */
     ParameterizedScheduleBuilder uniqueRequestId(String uniqueRequestId);
+
+    // TODO: Javadoc for groupId (including that blocking behaves differently)
+    ParameterizedScheduleBuilder groupId(String groupId);
 
     /**
      * Equivalent to {@link TransactionOutbox#schedule(Class)}, but applying additional parameters

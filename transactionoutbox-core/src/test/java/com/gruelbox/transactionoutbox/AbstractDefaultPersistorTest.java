@@ -153,6 +153,67 @@ abstract class AbstractDefaultPersistorTest {
   }
 
   @Test
+  void testBatchOnlyIncludesOldestEntryForEachGroupWhileRespectingSize() throws Exception {
+    txManager()
+        .inTransactionThrows(
+            tx -> {
+              persistor().save(tx, createEntry("FOO1", "group1", now, false));
+              persistor().save(tx, createEntry("FOO2", "group1", now, false));
+              persistor().save(tx, createEntry("FOO3", "group3", now, false));
+              persistor().save(tx, createEntry("FOO4", "group2", now, false));
+              persistor().save(tx, createEntry("FOO5", "group2", now, false));
+              persistor().save(tx, createEntry("FOO6", "group3", now, false));
+            });
+    txManager()
+        .inTransactionThrows(
+            tx ->
+                assertThat(
+                    persistor().selectBatch(tx, 2, now.plusMillis(1)),
+                    anyOf(
+                        containsInAnyOrder(matchesId("FOO1"), matchesId("FOO3")),
+                        containsInAnyOrder(matchesId("FOO1"), matchesId("FOO4")),
+                        containsInAnyOrder(matchesId("FOO3"), matchesId("FOO4")))));
+  }
+
+  /**
+   * Because non-grouped entries have already been attempted when transactions complete, grouped
+   * entries take precedence when selecting batches.
+   */
+  @Test
+  void testBatchGroupsTakePrecedence() throws Exception {
+    txManager()
+        .inTransactionThrows(
+            tx -> {
+              persistor().save(tx, createEntry("FOO1", now, false));
+              persistor().save(tx, createEntry("FOO2", "group1", now, false));
+              persistor().save(tx, createEntry("FOO3", now, false));
+              persistor().save(tx, createEntry("FOO4", "group2", now, false));
+              persistor().save(tx, createEntry("FOO5", now, false));
+            });
+    txManager()
+        .inTransactionThrows(
+            tx ->
+                assertThat(
+                    persistor().selectBatch(tx, 2, now.plusMillis(1)),
+                    contains(matchesId("FOO2"), matchesId("FOO4"))));
+  }
+
+  @Test
+  void testBatchNonGroupsIncludedWhenSizeAllows() throws Exception {
+    txManager()
+        .inTransactionThrows(
+            tx -> {
+              persistor().save(tx, createEntry("FOO1", now, false));
+              persistor().save(tx, createEntry("FOO2", now, false));
+              persistor().save(tx, createEntry("FOO3", "group1", now, false));
+              persistor().save(tx, createEntry("FOO4", "group2", now, false));
+            });
+    txManager()
+        .inTransactionThrows(
+            tx -> assertThat(persistor().selectBatch(tx, 4, now.plusMillis(1)), hasSize(4)));
+  }
+
+  @Test
   void testBlockedEntriesExcluded() throws Exception {
     txManager()
         .inTransactionThrows(
@@ -192,8 +253,30 @@ abstract class AbstractDefaultPersistorTest {
     }
   }
 
+  static class TransactionOutboxEntryIdMatcher extends TypeSafeMatcher<TransactionOutboxEntry> {
+    private final String entryId;
+
+    TransactionOutboxEntryIdMatcher(String entryId) {
+      this.entryId = entryId;
+    }
+
+    @Override
+    protected boolean matchesSafely(TransactionOutboxEntry other) {
+      return entryId.equals(other.getId());
+    }
+
+    @Override
+    public void describeTo(Description description) {
+      description.appendText("Should match on entry ID: ").appendText(entryId);
+    }
+  }
+
   TransactionOutboxEntryMatcher matches(TransactionOutboxEntry e) {
     return new TransactionOutboxEntryMatcher(e);
+  }
+
+  TransactionOutboxEntryIdMatcher matchesId(String entryId) {
+    return new TransactionOutboxEntryIdMatcher(entryId);
   }
 
   @Test
@@ -395,8 +478,14 @@ abstract class AbstractDefaultPersistorTest {
   }
 
   private TransactionOutboxEntry createEntry(String id, Instant nextAttemptTime, boolean blocked) {
+    return createEntry(id, null, nextAttemptTime, blocked);
+  }
+
+  private TransactionOutboxEntry createEntry(
+      String id, String groupId, Instant nextAttemptTime, boolean blocked) {
     return TransactionOutboxEntry.builder()
         .id(id)
+        .groupId(groupId)
         .invocation(createInvocation())
         .blocked(blocked)
         .lastAttemptTime(null)

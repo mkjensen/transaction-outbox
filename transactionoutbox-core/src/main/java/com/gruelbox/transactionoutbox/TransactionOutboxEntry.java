@@ -36,6 +36,9 @@ public class TransactionOutboxEntry implements Validatable {
   @Getter
   private final String uniqueRequestId;
 
+  // TODO: Javadoc for groupId
+  @Getter private final String groupId;
+
   /**
    * @param invocation The method invocation to perform.
    * @return The method invocation to perform.

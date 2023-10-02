@@ -1,7 +1,10 @@
 package com.gruelbox.transactionoutbox.acceptance;
 
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsInRelativeOrder;
 import static org.hamcrest.Matchers.empty;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasSize;
 import static org.junit.Assert.*;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -15,6 +18,7 @@ import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
@@ -226,10 +230,7 @@ abstract class AbstractAcceptanceTest {
                         .schedule(ClassProcessor.class)
                         .process("5")));
 
-    // Run the clock over the threshold
-    clockProvider.set(
-        Clock.fixed(clockProvider.get().instant().plusSeconds(120), clockProvider.get().getZone()));
-    outbox.flush();
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
 
     // We should now be able to add the work
     transactionManager.inTransaction(
@@ -241,6 +242,134 @@ abstract class AbstractAcceptanceTest {
                 .process("6"));
 
     MatcherAssert.assertThat(ids, containsInAnyOrder("1", "2", "4", "6"));
+  }
+
+  @Test
+  void orderedRequests() {
+
+    TransactionManager transactionManager = simpleTxnManager();
+
+    // Multiple threads can write to this list as groups are processed in parallel
+    List<String> ids = Collections.synchronizedList(new ArrayList<>());
+
+    AtomicReference<Clock> clockProvider = new AtomicReference<>(Clock.systemDefaultZone());
+
+    TransactionOutbox outbox =
+        TransactionOutbox.builder()
+            .transactionManager(transactionManager)
+            .listener(
+                new TransactionOutboxListener() {
+                  @Override
+                  public void success(TransactionOutboxEntry entry) {
+                    ids.add((String) entry.getInvocation().getArgs()[0]);
+                  }
+                })
+            .submitter(Submitter.withExecutor(Runnable::run))
+            .persistor(Persistor.forDialect(connectionDetails().dialect()))
+            .clockProvider(clockProvider::get)
+            .build();
+
+    clearOutbox();
+
+    transactionManager.inTransaction(
+        () -> outbox.with().groupId("group2").schedule(ClassProcessor.class).process("2-1"));
+    transactionManager.inTransaction(
+        () -> outbox.with().groupId("group2").schedule(ClassProcessor.class).process("2-2"));
+    transactionManager.inTransaction(
+        () -> outbox.with().groupId("group1").schedule(ClassProcessor.class).process("1-1"));
+    transactionManager.inTransaction(
+        () -> {
+          outbox.with().groupId("group2").schedule(ClassProcessor.class).process("2-3");
+          outbox.with().groupId("group1").schedule(ClassProcessor.class).process("1-2");
+          outbox.with().groupId("group1").schedule(ClassProcessor.class).process("1-3");
+        });
+
+    // Ensure no tasks were processed immediately, as group IDs were provided
+    MatcherAssert.assertThat(ids, equalTo(List.of()));
+
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
+    MatcherAssert.assertThat(ids, hasSize(2));
+    outbox.flush();
+    MatcherAssert.assertThat(ids, hasSize(4));
+    outbox.flush();
+    MatcherAssert.assertThat(ids, hasSize(6));
+
+    // Processing order within a group is important
+    MatcherAssert.assertThat(ids, containsInRelativeOrder("1-1", "1-2", "1-3"));
+    MatcherAssert.assertThat(ids, containsInRelativeOrder("2-1", "2-2", "2-3"));
+  }
+
+  @Test
+  void groupIsNotAutomaticallyBlocked() {
+
+    TransactionManager transactionManager = simpleTxnManager();
+
+    AtomicReference<Clock> clockProvider = new AtomicReference<>(Clock.systemDefaultZone());
+
+    AtomicInteger attempts = new AtomicInteger();
+
+    TransactionOutbox outbox =
+        TransactionOutbox.builder()
+            .transactionManager(transactionManager)
+            .submitter(Submitter.withExecutor(Runnable::run))
+            .persistor(Persistor.forDialect(connectionDetails().dialect()))
+            .instantiator(new FailingInstantiator(attempts))
+            .clockProvider(clockProvider::get)
+            .blockAfterAttempts(1) // <-- Must only apply to non-grouped tasks
+            .build();
+
+    transactionManager.inTransaction(
+        () -> outbox.with().groupId("group").schedule(InterfaceProcessor.class).process(3, "Whee"));
+
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
+
+    assertEquals(2, attempts.get());
+  }
+
+  @Test
+  void groupBlockAndThenUnblockForRetry() {
+
+    TransactionManager transactionManager = simpleTxnManager();
+
+    CountDownLatch successLatch = new CountDownLatch(1);
+    OrderedEntryListener orderedEntryListener =
+        new OrderedEntryListener(successLatch, new CountDownLatch(0));
+
+    AtomicInteger attempts = new AtomicInteger();
+
+    AtomicReference<Clock> clockProvider = new AtomicReference<>(Clock.systemDefaultZone());
+
+    TransactionOutbox outbox =
+        TransactionOutbox.builder()
+            .transactionManager(transactionManager)
+            .submitter(Submitter.withExecutor(Runnable::run))
+            .persistor(Persistor.forDialect(connectionDetails().dialect()))
+            .listener(orderedEntryListener)
+            .instantiator(new FailingInstantiator(attempts))
+            .clockProvider(clockProvider::get)
+            .build();
+
+    clearOutbox();
+
+    transactionManager.inTransaction(
+        () -> outbox.with().groupId("group").schedule(InterfaceProcessor.class).process(3, "Whee"));
+
+    String entryId = orderedEntryListener.getOrderedEntries().get(0).getId();
+
+    assertTrue(transactionManager.inTransactionReturns(tx -> outbox.block(entryId)));
+    assertFalse(transactionManager.inTransactionReturns(tx -> outbox.block(entryId)));
+
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
+
+    assertEquals(0, attempts.get());
+
+    assertTrue(transactionManager.inTransactionReturns(tx -> outbox.unblock(entryId)));
+    assertFalse(transactionManager.inTransactionReturns(tx -> outbox.unblock(entryId)));
+
+    incrementClockToNextAttemptTimeAndFlush(clockProvider, outbox);
+
+    assertEquals(1, attempts.get());
   }
 
   /**
@@ -617,6 +746,13 @@ abstract class AbstractAcceptanceTest {
             throw new RuntimeException(e);
           }
         });
+  }
+
+  private static void incrementClockToNextAttemptTimeAndFlush(
+      AtomicReference<Clock> clockProvider, TransactionOutbox outbox) {
+    clockProvider.set(
+        Clock.fixed(clockProvider.get().instant().plusSeconds(120), clockProvider.get().getZone()));
+    outbox.flush();
   }
 
   private void withRunningFlusher(TransactionOutbox outbox, ThrowingRunnable runnable)

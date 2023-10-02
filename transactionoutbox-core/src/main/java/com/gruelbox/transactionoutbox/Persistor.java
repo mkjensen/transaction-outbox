@@ -79,6 +79,9 @@ public interface Persistor {
    */
   boolean lock(Transaction tx, TransactionOutboxEntry entry) throws Exception;
 
+  // TODO: Javadoc for block
+  boolean block(Transaction tx, String entryId) throws Exception;
+
   /**
    * Clears the blocked flag and resets the attempt count to zero.
    *
@@ -90,6 +93,7 @@ public interface Persistor {
    */
   boolean unblock(Transaction tx, String entryId) throws Exception;
 
+  // TODO: Explain ordered vs. unordered
   /**
    * Selects up to a specified maximum number of non-blocked records which have passed their {@link
    * TransactionOutboxEntry#getNextAttemptTime()}. Until a subsequent call to {@link
